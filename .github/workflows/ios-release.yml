@@ -194,9 +194,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Load secrets from Infisical
+        if: inputs.infisical-project-slug != ''
+        uses: Infisical/secrets-action@v1.0.16
+        with:
+          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          domain: ${{ secrets.INFISICAL_DOMAIN }}
+          project-slug: ${{ inputs.infisical-project-slug }}
+          env-slug: ${{ inputs.infisical-env }}
+          secret-path: ${{ inputs.infisical-path }}
+
       - name: Load secrets passed by the caller
-        # Written to GITHUB_ENV so they reach every later step, and so values
-        # from Infisical (next step) can replace them.
+        # Runs after Infisical so a secret the caller passes wins. An app's own
+        # Infisical project can still hold an old Distribution certificate under
+        # the same name, and that must not replace the shared Development one.
         env:
           S_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
           S_ISSUER: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
@@ -234,17 +246,6 @@ jobs:
               put "$name" "$value"
             done <<< "$S_BUILD_ENV"
           fi
-
-      - name: Load secrets from Infisical
-        if: inputs.infisical-project-slug != ''
-        uses: Infisical/secrets-action@v1.0.16
-        with:
-          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
-          domain: ${{ secrets.INFISICAL_DOMAIN }}
-          project-slug: ${{ inputs.infisical-project-slug }}
-          env-slug: ${{ inputs.infisical-env }}
-          secret-path: ${{ inputs.infisical-path }}
 
       - name: Check signing secrets are present
         run: |
