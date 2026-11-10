@@ -48,7 +48,7 @@ on:
         type: number
         default: 26
       prepare-command:
-        description: Shell run from the repo root before the archive (npm build, cap sync, writing a config file). Sees every loaded secret as an env var.
+        description: Shell run from the repo root before project generation and the archive (npm build, cap sync, writing a config file, editing project.yml). Sees every loaded secret as an env var.
         type: string
         default: ""
       test-command:
@@ -330,11 +330,6 @@ jobs:
             command -v xcodegen >/dev/null || brew install xcodegen
           fi
 
-      - name: Generate Xcode project
-        if: inputs.xcodegen == 'true' || (inputs.xcodegen == 'auto' && hashFiles(format('{0}/project.yml', inputs.working-directory)) != '')
-        working-directory: ${{ inputs.working-directory }}
-        run: xcodegen generate
-
       - name: Check required config
         if: inputs.required-env != ''
         env:
@@ -351,9 +346,16 @@ jobs:
             exit 1
           fi
 
+      # Before project generation, so a prepare-command can edit project.yml
+      # (drop a target, fill in a placeholder) and have it take effect.
       - name: Prepare
         if: inputs.prepare-command != ''
         run: ${{ inputs.prepare-command }}
+
+      - name: Generate Xcode project
+        if: inputs.xcodegen == 'true' || (inputs.xcodegen == 'auto' && hashFiles(format('{0}/project.yml', inputs.working-directory)) != '')
+        working-directory: ${{ inputs.working-directory }}
+        run: xcodegen generate
 
       - name: Test
         if: inputs.test-command != ''
