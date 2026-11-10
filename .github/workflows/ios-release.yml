@@ -1,0 +1,597 @@
+name: iOS release (shared)
+
+# One archive -> export -> TestFlight path for every Pearson Media iOS app.
+# Apps call it with `uses: Pearson-Media/ios-release/.github/workflows/ios-release.yml@v1`
+# and pass their own settings as inputs. A fix made here reaches every app on
+# its next release, which is the point: before this, eight apps carried eight
+# hand-written release workflows and four different signing schemes.
+#
+# Signing is automatic, the way GradeThread proved it on 2026-11-10:
+#   - archive signs with an Apple Development identity imported from a .p12
+#     into a keychain this job creates (a runner that runs as a background
+#     service is refused the login keychain's private key, errSecInteractionNotAllowed);
+#   - export re-signs with Apple's cloud-managed Distribution certificate and an
+#     Xcode-managed App Store profile, fetched with the App Store Connect API key.
+# No provisioning profiles are imported and no project file is rewritten.
+#
+# Nothing in this file is secret. Keys and passwords arrive as `secrets:` from
+# the calling repo, or from Infisical when infisical-project-slug is set.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: 'Runner as JSON: "macos-15" or ["self-hosted","pearson-mac"].'
+        type: string
+        default: '"macos-15"'
+      working-directory:
+        description: Folder holding project.yml / the .xcodeproj, relative to the repo root.
+        type: string
+        default: ios
+      project:
+        description: The .xcodeproj (or .xcworkspace) to build, relative to working-directory.
+        type: string
+        required: true
+      scheme:
+        description: Scheme to archive.
+        type: string
+        required: true
+      configuration:
+        type: string
+        default: Release
+      xcodegen:
+        description: Run `xcodegen generate` first. "auto" runs it when project.yml exists.
+        type: string
+        default: auto
+      xcode-min-major:
+        description: Oldest Xcode major version allowed. App Store Connect rejects builds from an SDK older than iOS 26.
+        type: number
+        default: 26
+      prepare-command:
+        description: Shell run from the repo root before the archive (npm build, cap sync, writing a config file). Sees every loaded secret as an env var.
+        type: string
+        default: ""
+      test-command:
+        description: Shell run from the repo root before the archive. A failure stops the release.
+        type: string
+        default: ""
+      force-automatic-signing:
+        description: Override every target to automatic signing with an Apple Development identity and no named profile. Turn off only for a project already set up for automatic signing that needs its own identity settings.
+        type: boolean
+        default: true
+      build-settings:
+        description: Env var names, one per line or space separated, passed to xcodebuild as NAME=$NAME.
+        type: string
+        default: ""
+      required-env:
+        description: Env var names that must be set (and not a REPLACE_ME placeholder) or the release stops before archiving.
+        type: string
+        default: ""
+      production-entitlements:
+        description: Entitlements files (relative to working-directory, one per line) whose aps-environment is set to production.
+        type: string
+        default: ""
+      expected-entitlements:
+        description: Entitlement keys the signed app must carry, one per line. Checked on the exported .ipa.
+        type: string
+        default: ""
+      fail-on-missing-entitlements:
+        type: boolean
+        default: false
+      marketing-version:
+        description: X.Y.Z. Blank takes it from a vX.Y.Z tag, else keeps the project's own value.
+        type: string
+        default: ""
+      require-tag-on-branch:
+        description: When run from a tag, refuse unless the tagged commit is on this branch. Blank skips the check.
+        type: string
+        default: main
+      build-number:
+        description: CFBundleVersion. Blank uses the caller's run number plus build-number-offset.
+        type: string
+        default: ""
+      build-number-offset:
+        description: Added to the run number, so an app moving to this workflow keeps counting past its last build.
+        type: number
+        default: 0
+      release-notes:
+        description: TestFlight notes. Blank uses the tag message, else the commit subjects since the last v* tag.
+        type: string
+        default: ""
+      upload:
+        description: Upload to TestFlight. false stops after the .ipa is built.
+        type: boolean
+        default: true
+      infisical-project-slug:
+        description: Load secrets from this Infisical project. Blank uses only the secrets passed in.
+        type: string
+        default: ""
+      infisical-env:
+        type: string
+        default: prod
+      infisical-path:
+        type: string
+        default: /
+      timeout-minutes:
+        type: number
+        default: 60
+      min-free-disk-gb:
+        description: Stop before building when the runner's disk has less free space than this.
+        type: number
+        default: 15
+    secrets:
+      APP_STORE_CONNECT_API_KEY_ID:
+        required: false
+      APP_STORE_CONNECT_API_ISSUER_ID:
+        required: false
+      APP_STORE_CONNECT_API_KEY_BASE64:
+        required: false
+      BUILD_CERTIFICATE_BASE64:
+        required: false
+      P12_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+      BUILD_ENV:
+        description: Extra KEY=VALUE lines (app config such as SUPABASE_URL) exported to every step.
+        required: false
+      SENTRY_AUTH_TOKEN:
+        required: false
+      INFISICAL_CLIENT_ID:
+        required: false
+      INFISICAL_CLIENT_SECRET:
+        required: false
+      INFISICAL_DOMAIN:
+        required: false
+    outputs:
+      version:
+        value: ${{ jobs.release.outputs.version }}
+      build-number:
+        value: ${{ jobs.release.outputs.build-number }}
+
+jobs:
+  release:
+    name: Archive + TestFlight upload
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # One release per app at a time: a second one waits instead of killing a
+    # build that may be mid-upload.
+    concurrency:
+      group: ios-release-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build-number: ${{ steps.build_number.outputs.value }}
+    env:
+      WORKDIR: ${{ inputs.working-directory }}
+
+    steps:
+      - name: Set build paths
+        # Build files live in the job's temp folder and are deleted at the end,
+        # so release builds never pile up on a self-hosted Mac.
+        run: |
+          {
+            echo "ARCHIVE_PATH=$RUNNER_TEMP/app.xcarchive"
+            echo "EXPORT_PATH=$RUNNER_TEMP/export"
+            echo "DERIVED_DATA=$RUNNER_TEMP/DerivedData"
+          } >> "$GITHUB_ENV"
+
+      - name: Check free disk space
+        # A full disk fails a build in confusing ways, and on 2026-11-09 the
+        # Mac mini sat at 119 MB free. Say so plainly instead.
+        env:
+          MIN_GB: ${{ inputs.min-free-disk-gb }}
+        run: |
+          set -euo pipefail
+          FREE_GB=$(df -g "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+          echo "Free disk: ${FREE_GB} GB (need ${MIN_GB})"
+          if [ "$FREE_GB" -lt "$MIN_GB" ]; then
+            echo "::error::Only ${FREE_GB} GB free on the runner; a release build needs about ${MIN_GB} GB. Clear old Xcode build files (~/Library/Developer/Xcode/DerivedData) and run again."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Load secrets passed by the caller
+        # Written to GITHUB_ENV so they reach every later step, and so values
+        # from Infisical (next step) can replace them.
+        env:
+          S_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          S_ISSUER: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          S_KEY_B64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          S_CERT: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          S_P12: ${{ secrets.P12_PASSWORD }}
+          S_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          S_SENTRY: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          S_BUILD_ENV: ${{ secrets.BUILD_ENV }}
+        run: |
+          set -euo pipefail
+          put() {
+            local name="$1" value="$2" delim
+            [ -n "$value" ] || return 0
+            delim="EOV_$(openssl rand -hex 8)"
+            { echo "${name}<<${delim}"; printf '%s\n' "$value"; echo "$delim"; } >> "$GITHUB_ENV"
+          }
+          put APP_STORE_CONNECT_API_KEY_ID "$S_KEY_ID"
+          put APP_STORE_CONNECT_API_ISSUER_ID "$S_ISSUER"
+          put APP_STORE_CONNECT_API_KEY_BASE64 "$S_KEY_B64"
+          put BUILD_CERTIFICATE_BASE64 "$S_CERT"
+          put P12_PASSWORD "$S_P12"
+          put APPLE_TEAM_ID "$S_TEAM"
+          put SENTRY_AUTH_TOKEN "$S_SENTRY"
+          if [ -n "$S_BUILD_ENV" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line%$'\r'}"
+              case "$line" in ''|'#'*) continue ;; esac
+              name="${line%%=*}"; value="${line#*=}"
+              if ! [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || [ "$name" = "$line" ]; then
+                echo "::error::BUILD_ENV has a line that is not NAME=VALUE (name shown: ${name:0:40})."
+                exit 1
+              fi
+              [ -n "$value" ] && echo "::add-mask::$value"
+              put "$name" "$value"
+            done <<< "$S_BUILD_ENV"
+          fi
+
+      - name: Load secrets from Infisical
+        if: inputs.infisical-project-slug != ''
+        uses: Infisical/secrets-action@v1.0.16
+        with:
+          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          domain: ${{ secrets.INFISICAL_DOMAIN }}
+          project-slug: ${{ inputs.infisical-project-slug }}
+          env-slug: ${{ inputs.infisical-env }}
+          secret-path: ${{ inputs.infisical-path }}
+
+      - name: Check signing secrets are present
+        run: |
+          set -uo pipefail
+          missing=()
+          for name in APP_STORE_CONNECT_API_KEY_ID APP_STORE_CONNECT_API_ISSUER_ID APP_STORE_CONNECT_API_KEY_BASE64 BUILD_CERTIFICATE_BASE64 P12_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!name:-}" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing signing secrets: ${missing[*]}. Pass them as secrets from the calling workflow, or set infisical-project-slug."
+            exit 1
+          fi
+
+      - name: Resolve version
+        id: version
+        uses: actions/github-script@v7
+        env:
+          INPUT_VERSION: ${{ inputs.marketing-version }}
+          REQUIRE_BRANCH: ${{ inputs.require-tag-on-branch }}
+        with:
+          script: |
+            const semver = /^[0-9]+\.[0-9]+\.[0-9]+$/;
+            let version = (process.env.INPUT_VERSION || '').trim();
+            if (!version && context.ref.startsWith('refs/tags/v')) {
+              version = context.ref.slice('refs/tags/v'.length);
+            }
+            if (version && !semver.test(version)) {
+              core.setFailed(`Version '${version}' is not X.Y.Z.`);
+              return;
+            }
+            const branch = (process.env.REQUIRE_BRANCH || '').trim();
+            if (branch && context.ref.startsWith('refs/tags/')) {
+              const { owner, repo } = context.repo;
+              const { data } = await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `${branch}...${context.sha}`,
+              });
+              if (data.status !== 'identical' && data.status !== 'behind') {
+                core.setFailed(`${context.ref} points at ${context.sha}, which is not on ${branch}. Tag a commit on ${branch}.`);
+                return;
+              }
+            }
+            core.setOutput('version', version);
+            core.notice(version ? `Version ${version}` : 'No version given: the project value stands.');
+
+      - name: Resolve build number
+        id: build_number
+        env:
+          INPUT_BUILD: ${{ inputs.build-number }}
+          OFFSET: ${{ inputs.build-number-offset }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_BUILD" ]; then N="$INPUT_BUILD"; else N=$(( GITHUB_RUN_NUMBER + OFFSET )); fi
+          echo "value=$N" >> "$GITHUB_OUTPUT"
+          echo "Build number: $N"
+
+      - name: Select Xcode
+        env:
+          MIN_MAJOR: ${{ inputs.xcode-min-major }}
+        run: |
+          set -euo pipefail
+          # Newest /Applications/Xcode_<n>*.app at or above the minimum, else Xcode.app.
+          PICK=""
+          for app in $(find /Applications -maxdepth 1 -name 'Xcode_*.app' 2>/dev/null | sort -V -r); do
+            major=$(basename "$app" .app | sed -E 's/^Xcode_([0-9]+).*/\1/')
+            if [[ "$major" =~ ^[0-9]+$ ]] && [ "$major" -ge "$MIN_MAJOR" ]; then PICK="$app"; break; fi
+          done
+          [ -n "$PICK" ] || PICK=/Applications/Xcode.app
+          sudo -n xcode-select -s "$PICK/Contents/Developer" 2>/dev/null || export DEVELOPER_DIR="$PICK/Contents/Developer"
+          echo "DEVELOPER_DIR=$PICK/Contents/Developer" >> "$GITHUB_ENV"
+          VER=$(DEVELOPER_DIR="$PICK/Contents/Developer" xcodebuild -version | head -1 | awk '{print $2}')
+          echo "Using $PICK ($VER)"
+          if [ "${VER%%.*}" -lt "$MIN_MAJOR" ]; then
+            echo "::error::Xcode $VER is older than $MIN_MAJOR. App Store Connect rejects builds from an older SDK. Install Xcode $MIN_MAJOR on the runner."
+            exit 1
+          fi
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          command -v xcbeautify >/dev/null || brew install xcbeautify
+          if [ "${{ inputs.xcodegen }}" = "true" ] || { [ "${{ inputs.xcodegen }}" = "auto" ] && [ -f "$WORKDIR/project.yml" ]; }; then
+            command -v xcodegen >/dev/null || brew install xcodegen
+          fi
+
+      - name: Generate Xcode project
+        if: inputs.xcodegen == 'true' || (inputs.xcodegen == 'auto' && hashFiles(format('{0}/project.yml', inputs.working-directory)) != '')
+        working-directory: ${{ inputs.working-directory }}
+        run: xcodegen generate
+
+      - name: Check required config
+        if: inputs.required-env != ''
+        env:
+          NAMES: ${{ inputs.required-env }}
+        run: |
+          set -uo pipefail
+          bad=()
+          for name in $NAMES; do
+            value="${!name:-}"
+            if [ -z "$value" ] || [[ "$value" == REPLACE_ME* ]]; then bad+=("$name"); fi
+          done
+          if [ "${#bad[@]}" -gt 0 ]; then
+            echo "::error::Empty or placeholder config: ${bad[*]}. The app would ship without it. Add the values to the caller's secrets or Infisical."
+            exit 1
+          fi
+
+      - name: Prepare
+        if: inputs.prepare-command != ''
+        run: ${{ inputs.prepare-command }}
+
+      - name: Test
+        if: inputs.test-command != ''
+        run: ${{ inputs.test-command }}
+
+      - name: Set aps-environment to production
+        if: inputs.production-entitlements != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          FILES: ${{ inputs.production-entitlements }}
+        run: |
+          set -euo pipefail
+          for f in $FILES; do
+            /usr/libexec/PlistBuddy -c "Set :aps-environment production" "$f" \
+              || /usr/libexec/PlistBuddy -c "Add :aps-environment string production" "$f"
+            echo "$f: aps-environment=$(/usr/libexec/PlistBuddy -c 'Print :aps-environment' "$f")"
+          done
+
+      - name: Import signing certificate
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          printf '%s' "$BUILD_CERTIFICATE_BASE64" | tr -d '\r\n' | base64 --decode -o "$CERT_PATH"
+          if [ ! -s "$CERT_PATH" ]; then
+            echo "::error::BUILD_CERTIFICATE_BASE64 is not valid base64."
+            exit 1
+          fi
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Recorded before anything else can fail, so cleanup always finds it.
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          if ! security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"; then
+            rm -f "$CERT_PATH"
+            echo "::error::The .p12 would not import. P12_PASSWORD does not match BUILD_CERTIFICATE_BASE64; export the certificate again and update both together."
+            exit 1
+          fi
+          rm -f "$CERT_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+          echo "Identities in the job keychain:"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Install App Store Connect API key
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY_BASE64" | tr -d '\r\n' | base64 --decode -o "$KEY_PATH"
+          if ! openssl pkey -in "$KEY_PATH" -noout 2>/dev/null; then
+            echo "::error::APP_STORE_CONNECT_API_KEY_BASE64 is not the base64 of a valid .p8 key."
+            exit 1
+          fi
+          echo "ASC_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+          case "$APP_STORE_CONNECT_API_ISSUER_ID" in
+            ????????-????-????-????-????????????) ;;
+            *) echo "::warning::APP_STORE_CONNECT_API_ISSUER_ID is not a UUID. It may be swapped with the Key ID." ;;
+          esac
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/spm
+          key: spm-${{ runner.os }}-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Archive
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJECT: ${{ inputs.project }}
+          SCHEME: ${{ inputs.scheme }}
+          CONFIGURATION: ${{ inputs.configuration }}
+          SETTINGS: ${{ inputs.build-settings }}
+          FORCE_AUTOMATIC: ${{ inputs.force-automatic-signing }}
+          MV: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ steps.build_number.outputs.value }}
+        run: |
+          set -o pipefail
+          ARGS=()
+          case "$PROJECT" in
+            *.xcworkspace) ARGS+=(-workspace "$PROJECT") ;;
+            *) ARGS+=(-project "$PROJECT") ;;
+          esac
+          # Force automatic signing on every target. Projects that used to sign
+          # by hand still name a profile or a Distribution identity per target,
+          # and either one makes automatic signing refuse to start.
+          SIGNING_OVERRIDES=()
+          if [ "$FORCE_AUTOMATIC" = "true" ]; then
+            SIGNING_OVERRIDES=(CODE_SIGN_STYLE=Automatic "CODE_SIGN_IDENTITY=Apple Development" PROVISIONING_PROFILE_SPECIFIER= PROVISIONING_PROFILE=)
+          fi
+          EXTRA=()
+          [ -n "$MV" ] && EXTRA+=("MARKETING_VERSION=$MV")
+          for name in $SETTINGS; do EXTRA+=("$name=${!name:-}"); done
+          set +e
+          xcodebuild "${ARGS[@]}" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            -derivedDataPath "$DERIVED_DATA" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/spm" \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID" \
+            -authenticationKeyIssuerID "$APP_STORE_CONNECT_API_ISSUER_ID" \
+            -allowProvisioningUpdates \
+            "${SIGNING_OVERRIDES[@]}" \
+            CODE_SIGNING_ALLOWED=YES \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            "${EXTRA[@]}" \
+            archive 2>&1 | tee "$RUNNER_TEMP/archive-raw.log" | xcbeautify --renderer github-actions
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            # xcbeautify hides file paths and says nothing about a refused
+            # codesign, so repeat the raw lines that name the cause.
+            echo "::group::Raw xcodebuild errors"
+            grep -nE "error: |errSec|Command .* failed|unable to type-check this expression|No profiles for|requires a provisioning profile" "$RUNNER_TEMP/archive-raw.log" | head -60 || true
+            echo "::endgroup::"
+          fi
+          exit "$RC"
+
+      - name: Upload dSYMs to Sentry
+        if: env.SENTRY_AUTH_TOKEN != '' && env.SENTRY_ORG != '' && env.SENTRY_PROJECT != ''
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          command -v sentry-cli >/dev/null || brew install getsentry/tools/sentry-cli
+          sentry-cli debug-files upload --org "$SENTRY_ORG" --project "$SENTRY_PROJECT" "$ARCHIVE_PATH/dSYMs"
+
+      - name: Export .ipa
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key><string>app-store-connect</string>
+              <key>teamID</key><string>$APPLE_TEAM_ID</string>
+              <key>signingStyle</key><string>automatic</string>
+              <key>uploadSymbols</key><true/>
+              <key>destination</key><string>export</string>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$EXPORT_PATH" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID" \
+            -authenticationKeyIssuerID "$APP_STORE_CONNECT_API_ISSUER_ID" 2>&1 | xcbeautify --renderer github-actions
+
+      - name: Check entitlements
+        if: inputs.expected-entitlements != ''
+        env:
+          EXPECTED: ${{ inputs.expected-entitlements }}
+          FATAL: ${{ inputs.fail-on-missing-entitlements }}
+        run: |
+          set -uo pipefail
+          IPA=$(find "$EXPORT_PATH" -maxdepth 1 -name '*.ipa' | head -n1)
+          WORK="$RUNNER_TEMP/ipa-inspect"; rm -rf "$WORK"; mkdir -p "$WORK"
+          unzip -q -o "$IPA" -d "$WORK"
+          APP=$(find "$WORK/Payload" -maxdepth 1 -name '*.app' | head -n1)
+          ENT=$(codesign -d --entitlements :- "$APP" 2>/dev/null || true)
+          missing=()
+          for key in $EXPECTED; do printf '%s' "$ENT" | grep -q "<key>$key</key>" || missing+=("$key"); done
+          if [ "${#missing[@]}" -eq 0 ]; then echo "All expected entitlements present."; exit 0; fi
+          if [ "$FATAL" = "true" ]; then
+            echo "::error::The signed app is missing: ${missing[*]}. Turn the capability on for the App ID in the Apple developer portal."
+            exit 1
+          fi
+          echo "::warning::The signed app is missing: ${missing[*]}. Turn the capability on for the App ID in the Apple developer portal."
+
+      - name: Upload to TestFlight
+        if: inputs.upload
+        run: |
+          set -uo pipefail
+          IPA=$(find "$EXPORT_PATH" -maxdepth 1 -name '*.ipa' | head -n1)
+          if [ -z "$IPA" ]; then echo "::error::No .ipa was exported."; exit 1; fi
+          echo "Uploading $IPA"
+          xcrun altool --upload-app --type ios --file "$IPA" \
+            --apiKey "$APP_STORE_CONNECT_API_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_API_ISSUER_ID" 2>&1 | tee "$RUNNER_TEMP/upload.log"
+          RC=${PIPESTATUS[0]}
+          # altool has returned 0 on a rejected upload, so read its words too.
+          if [ "$RC" -ne 0 ] || grep -qE "UPLOAD FAILED|ERROR ITMS-|Failed to upload" "$RUNNER_TEMP/upload.log"; then
+            echo "::error::TestFlight upload failed. Apple's reason is in the lines above."
+            exit 1
+          fi
+
+      - name: Write summary
+        if: success()
+        env:
+          MANUAL_NOTES: ${{ inputs.release-notes }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ steps.build_number.outputs.value }}
+          UPLOADED: ${{ inputs.upload }}
+        run: |
+          set -uo pipefail
+          if [ -n "$MANUAL_NOTES" ]; then
+            NOTES="$MANUAL_NOTES"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            NOTES=$(git for-each-ref --format='%(contents)' "$GITHUB_REF")
+          else
+            PREV=$(git tag -l 'v*' --sort=-creatordate | head -n1)
+            if [ -n "$PREV" ]; then NOTES=$(git log "$PREV"..HEAD --pretty=format:'- %s'); else NOTES=$(git log -10 --pretty=format:'- %s'); fi
+          fi
+          {
+            echo "## ${VERSION:-project version} build ${BUILD_NUMBER}"
+            [ "$UPLOADED" = "true" ] && echo "Uploaded to TestFlight. Apple takes about 5 to 15 minutes to process it."
+            echo ""
+            echo "What to test:"
+            echo '```'
+            printf '%s\n' "$NOTES"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the .ipa
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-${{ steps.build_number.outputs.value }}
+          path: ${{ runner.temp }}/export/*.ipa
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Clean up
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+          security list-keychain -d user -s login.keychain || true
+          [ -n "${ASC_KEY_PATH:-}" ] && rm -f "$ASC_KEY_PATH" || true
+          rm -rf "$DERIVED_DATA" "$ARCHIVE_PATH" "$EXPORT_PATH" || true
